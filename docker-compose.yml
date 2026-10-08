@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: switchboard-db
+    environment:
+      POSTGRES_USER: sync
+      POSTGRES_PASSWORD: sync
+      POSTGRES_DB: switchboard
+    ports:
+      - "5433:5432"
+    volumes:
+      - switchboard-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sync -d switchboard"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  switchboard-data:
