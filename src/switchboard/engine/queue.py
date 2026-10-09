@@ -42,7 +42,7 @@ from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from .errors import PermanentError, RetryableError
+from .errors import AuthError, PermanentError, RetryableError
 
 BACKOFF_BASE_SECONDS = 5.0
 BACKOFF_CAP_SECONDS = 15 * 60.0
@@ -111,6 +111,11 @@ async def enqueue(
 # were waiting. With no lock at all, both can read the same id and both
 # "claim" it.
 #
+# The EXISTS skips jobs whose connection needs re-authorising or is disabled.
+# They wait as 'pending' and resume by themselves once the connection is
+# active again. It is EXISTS rather than a JOIN so FOR UPDATE locks only the
+# job row, not the connection row every worker would then contend on.
+#
 # attempts is incremented here, at claim time, not at failure time. A job that
 # crashes the worker outright never reaches fail(), and must still use up its
 # budget, or one poison job would take down every worker forever.
@@ -125,6 +130,8 @@ WHERE id = (
     FROM sync_job
     WHERE status = 'pending'
       AND run_after <= now()
+      AND EXISTS (SELECT 1 FROM connection c
+                  WHERE c.id = sync_job.connection_id AND c.status = 'active')
     ORDER BY run_after, created_at
     FOR UPDATE SKIP LOCKED
     LIMIT 1
@@ -177,11 +184,18 @@ SET status     = 'pending',
 WHERE id = %(id)s AND status = 'running' AND attempts = %(attempts)s
 """
 
+PARK_SQL = """
+UPDATE sync_job
+SET status = 'pending', locked_at = NULL, attempts = attempts - 1,
+    last_error = %(error)s, run_after = now(), updated_at = now()
+WHERE id = %(id)s AND status = 'running' AND attempts = %(attempts)s
+"""
+
 
 async def fail(
     conn: AsyncConnection, job: Job, error: BaseException, *, rng: random.Random | None = None
 ) -> str:
-    """Record a failure. Returns 'retrying', 'dead', or 'lost_lease'.
+    """Record a failure. Returns 'retrying', 'parked', 'dead', or 'lost_lease'.
 
     Backoff is just a future run_after. No timers and no sleeping worker: the
     claim query does not see the job until it is due, and a restart loses
@@ -193,6 +207,13 @@ async def fail(
     permanent, would dead-letter every transient failure we forgot to label.
     """
     params = {"id": job.id, "attempts": job.attempts, "error": f"{type(error).__name__}: {error}"[:2000]}
+
+    if isinstance(error, AuthError):
+        # Not the job's fault, so refund the attempt and put it back. The
+        # worker marks the connection needs_reauth, which hides the job from
+        # the claim query until someone reconnects.
+        cur = await conn.execute(PARK_SQL, params)
+        return "parked" if cur.rowcount == 1 else "lost_lease"
 
     if isinstance(error, PermanentError) or job.attempts >= job.max_attempts:
         cur = await conn.execute(DEAD_LETTER_SQL, params)

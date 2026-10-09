@@ -1,0 +1,9 @@
+{
+  "external_id": "$.id",
+  "source_created_at": {"source": "$.created", "format": "epoch_seconds"},
+  "fields": [
+    {"canonical": "primary_email", "source": "$.email", "transforms": ["trim", "lower"], "required": true},
+    {"canonical": "full_name", "source": "$.name", "transforms": ["trim", "nullify_empty"]},
+    {"canonical": "phone", "source": "$.phone", "transforms": ["digits", "nullify_empty"]}
+  ]
+}

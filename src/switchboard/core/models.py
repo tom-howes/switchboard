@@ -54,6 +54,23 @@ class Page(BaseModel):
     next_cursor: str | None = None
 
 
+class WebhookEvent(BaseModel):
+    """One record-level change announced by a webhook.
+
+    `record` is the full payload when the provider includes it (Stripe does)
+    and None when it does not (HubSpot), in which case the engine calls
+    fetch_one. Either way the engine runs the same mapping over the same
+    payload shape a backfill sees, so there is one normalisation path, not two.
+    """
+
+    event_id: str
+    topic: str
+    external_id: str
+    occurred_at: datetime
+    deleted: bool = False
+    record: dict | None = None
+
+
 class Credentials(BaseModel):
     """Whatever a provider needs to make a call.
 

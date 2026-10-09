@@ -18,11 +18,11 @@ from .config import get_settings
 _pool: AsyncConnectionPool | None = None
 
 
-async def open_pool() -> AsyncConnectionPool:
+async def open_pool(url: str | None = None) -> AsyncConnectionPool:
     global _pool
     if _pool is None:
         _pool = AsyncConnectionPool(
-            get_settings().database_url,
+            url or get_settings().database_url,
             min_size=1,
             max_size=10,
             kwargs={"row_factory": dict_row},

@@ -18,8 +18,8 @@ from datetime import timedelta
 from typing import Awaitable, Callable
 
 from .. import db
-from . import queue
-from .errors import PermanentError
+from . import connections, queue
+from .errors import AuthError, PermanentError
 from .queue import Job
 
 log = logging.getLogger("switchboard.worker")
@@ -58,6 +58,8 @@ async def run_once() -> bool:
     except Exception as exc:
         async with db.pool().connection() as conn:
             outcome = await queue.fail(conn, job, exc)
+            if isinstance(exc, AuthError):
+                await connections.mark_needs_reauth(conn, job.connection_id)
         log.warning("job %s (%s) attempt %d failed, %s: %s", job.id, job.kind, job.attempts, outcome, exc)
     else:
         async with db.pool().connection() as conn:
@@ -67,7 +69,8 @@ async def run_once() -> bool:
 
 
 async def run_forever() -> None:
-    """Poll for work. Single process for now: see the known gaps in CLAUDE.md.
+    """Poll for work. Single process for now (a known gap; the SKIP LOCKED claim
+    is already safe for more).
 
     Polling every second is the simple option. LISTEN/NOTIFY would wake the
     worker the instant a job is enqueued, but it still needs a poll as a
@@ -75,6 +78,8 @@ async def run_forever() -> None:
     is the part that has to exist either way.
     """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    from . import sync  # noqa: F401  importing it registers the handlers
+
     await db.open_pool()
     loop = asyncio.get_running_loop()
     next_reap = 0.0

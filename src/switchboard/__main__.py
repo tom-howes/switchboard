@@ -43,7 +43,50 @@ def worker() -> None:
     run(run_forever())
 
 
-COMMANDS = {"serve": serve, "worker": worker}
+async def _connect(provider: str) -> None:
+    """Connect a provider for the default workspace and start its backfill.
+
+    Idempotent: re-running it rotates the stored credentials and restarts the
+    backfill, which is also how you recover a connection from needs_reauth.
+    """
+    from . import db
+    from .connectors import get_connector
+    from .engine import connections, mappings, sync
+
+    connector = get_connector(provider)
+    creds = await connector.authorize(code="", state="")
+    await db.open_pool()
+    try:
+        async with db.transaction() as conn:
+            cur = await conn.execute("SELECT id FROM workspace WHERE name = 'default'")
+            row = await cur.fetchone()
+            if row is None:
+                cur = await conn.execute("INSERT INTO workspace (name) VALUES ('default') RETURNING id")
+                row = await cur.fetchone()
+            workspace_id = row["id"]
+
+            cur = await conn.execute(
+                "SELECT 1 FROM field_mapping WHERE provider = %s AND status = 'approved'", (provider,)
+            )
+            if await cur.fetchone() is None:
+                await mappings.approve(conn, provider, mappings.seed_rules(provider), approved_by="seed")
+
+            connection_id = await connections.save(conn, workspace_id, provider, creds)
+            await sync.start_backfill(conn, connection_id)
+    finally:
+        await db.close_pool()
+    print(f"connected {provider}: {connection_id}")
+    print(f"webhook url: {get_settings().public_url}/webhooks/{provider}/{connection_id}")
+    print("backfill queued; run `python -m switchboard worker` to process it")
+
+
+def connect() -> None:
+    if len(sys.argv) < 3:
+        raise SystemExit("usage: python -m switchboard connect <provider>")
+    run(_connect(sys.argv[2]))
+
+
+COMMANDS = {"serve": serve, "worker": worker, "connect": connect}
 
 
 if __name__ == "__main__":

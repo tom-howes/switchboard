@@ -9,6 +9,7 @@ tests skip rather than fail: the mapping tests still need nothing at all.
 from __future__ import annotations
 
 import asyncio
+import base64
 import importlib.util
 import os
 import pathlib
@@ -18,6 +19,11 @@ import sys
 import psycopg
 import pytest
 from psycopg import AsyncConnection
+
+# Set before anything reads settings (they are cached on first read). A fresh
+# random key per run: no test may depend on a particular key existing.
+os.environ.setdefault("CREDENTIALS_KEY", base64.b64encode(os.urandom(32)).decode())
+os.environ.setdefault("STRIPE_WEBHOOK_SECRET", "whsec_test_secret")
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 ADMIN_URL = os.environ.get("DATABASE_URL", "postgresql://sync:sync@localhost:5433/switchboard")
@@ -75,3 +81,14 @@ async def connection_id(db):
         (workspace_id,),
     )
     return (await cur.fetchone())[0]
+
+
+@pytest.fixture
+async def pool(test_database_url, db):
+    """The app's own connection pool, pointed at the test database, for tests
+    that exercise handlers and routes rather than single queries."""
+    from switchboard import db as app_db
+
+    await app_db.open_pool(test_database_url)
+    yield app_db.pool()
+    await app_db.close_pool()

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from .models import Capability, Credentials, Page, Person, WriteResult
+from .models import Capability, Credentials, Page, Person, RawRecord, WebhookEvent, WriteResult
 
 
 @runtime_checkable
@@ -66,8 +66,26 @@ class Connector(Protocol):
         """
         ...
 
-    def webhook_event_id(self, raw_body: bytes, headers: dict[str, str]) -> str:
-        """The provider's own id for this delivery, used for replay dedupe."""
+    def parse_webhook(self, raw_body: bytes, headers: dict[str, str]) -> list[WebhookEvent]:
+        """Turn one delivery into the record-level events it carries.
+
+        A list, because HubSpot batches up to 100 events into one POST while
+        Stripe sends one per request. Events the engine does not care about
+        (invoices, subscriptions) come back as an empty list: acknowledged so
+        the provider stops redelivering, but not queued.
+
+        Only called after verify_webhook has passed. Parsing an unverified body
+        means running a JSON parser over attacker-controlled input for nothing.
+        """
+        ...
+
+    async def fetch_one(self, creds: Credentials, external_id: str) -> RawRecord | None:
+        """The current state of one record, or None if it no longer exists.
+
+        Needed because not every provider puts the record in its webhook:
+        HubSpot sends only the object id and which property changed, so the
+        engine has to come back and read it.
+        """
         ...
 
     # ---- writing (only if Capability.WRITE) --------------------------
