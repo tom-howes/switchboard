@@ -1,0 +1,11 @@
+{
+  "external_id": "$.id",
+  "source_created_at": {"source": "$.createdAt", "format": "iso8601"},
+  "source_updated_at": {"source": "$.updatedAt", "format": "iso8601"},
+  "fields": [
+    {"canonical": "primary_email", "source": "$.properties.email", "transforms": ["trim", "lower"], "required": true},
+    {"canonical": "given_name", "source": "$.properties.firstname", "transforms": ["trim", "nullify_empty"]},
+    {"canonical": "family_name", "source": "$.properties.lastname", "transforms": ["trim", "nullify_empty"]},
+    {"canonical": "phone", "source": "$.properties.phone", "transforms": ["digits", "nullify_empty"]}
+  ]
+}

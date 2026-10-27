@@ -79,12 +79,13 @@ async def backfill_page(job: Job) -> None:
         mapping_id, mapping = await mappings.approved(conn, connection.provider)
 
     connector = get_connector(connection.provider)
+    creds = await connections.fresh_credentials(connection, connector)
     # Taken BEFORE the request. Anything that changed after this moment may or
     # may not be in the response, so claiming the earlier time is the honest
     # version: a webhook for a change made mid-request will carry a later time
     # and correctly win.
     observed_at = _now()
-    page = await connector.list_changes(connection.credentials, current)
+    page = await connector.list_changes(creds, current)
 
     async with db.transaction() as conn:
         cur = await conn.execute(
@@ -119,8 +120,10 @@ async def apply_webhook(job: Job) -> None:
     if payload is None and not deleted:
         # The provider only told us something changed. Read the current state;
         # it is current as of now, so it is versioned as of now.
+        connector = get_connector(connection.provider)
+        creds = await connections.fresh_credentials(connection, connector)
         observed_at = _now()
-        fetched = await get_connector(connection.provider).fetch_one(connection.credentials, event.external_id)
+        fetched = await connector.fetch_one(creds, event.external_id)
         if fetched is None:
             deleted = True
         else:

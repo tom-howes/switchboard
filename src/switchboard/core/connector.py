@@ -57,8 +57,12 @@ class Connector(Protocol):
 
     # ---- webhooks ----------------------------------------------------
 
-    def verify_webhook(self, raw_body: bytes, headers: dict[str, str]) -> bool:
+    def verify_webhook(self, raw_body: bytes, headers: dict[str, str], url: str) -> bool:
         """Verify a webhook signature.
+
+        `url` is the public URL the provider called. Stripe ignores it;
+        HubSpot's v3 signature covers method + URL + body + timestamp, so a
+        signed body replayed against a different endpoint fails.
 
         Takes the RAW body, not a parsed object. Every JSON parser normalises
         whitespace and key order somewhere, and a signature computed over

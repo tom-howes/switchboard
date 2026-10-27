@@ -21,7 +21,6 @@ class Settings(BaseSettings):
 
     hubspot_client_id: str = ""
     hubspot_client_secret: str = ""
-    hubspot_webhook_secret: str = ""
 
     anthropic_api_key: str = ""
     mapping_model: str = "claude-sonnet-5-5"

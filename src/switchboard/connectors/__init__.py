@@ -11,6 +11,7 @@ from typing import Callable
 from ..config import get_settings
 from ..core.connector import Connector
 from ..engine.errors import PermanentError
+from .hubspot import HubSpotConnector
 from .stripe import StripeConnector
 
 
@@ -19,8 +20,14 @@ def _stripe() -> Connector:
     return StripeConnector(api_key=s.stripe_api_key, webhook_secret=s.stripe_webhook_secret)
 
 
+def _hubspot() -> Connector:
+    s = get_settings()
+    return HubSpotConnector(client_id=s.hubspot_client_id, client_secret=s.hubspot_client_secret)
+
+
 FACTORIES: dict[str, Callable[[], Connector]] = {
     "stripe": _stripe,
+    "hubspot": _hubspot,
 }
 
 

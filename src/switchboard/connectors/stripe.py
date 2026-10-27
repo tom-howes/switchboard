@@ -100,7 +100,7 @@ class StripeConnector:
 
     # ---- webhooks ----------------------------------------------------
 
-    def verify_webhook(self, raw_body: bytes, headers: dict[str, str]) -> bool:
+    def verify_webhook(self, raw_body: bytes, headers: dict[str, str], url: str = "") -> bool:
         """Stripe-Signature: t=1728000000,v1=<hex>[,v1=<hex>...]
 
         More than one v1 appears while a webhook secret is being rolled, so

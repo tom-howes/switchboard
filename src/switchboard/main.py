@@ -7,6 +7,7 @@ from uuid import UUID
 
 from fastapi import FastAPI, HTTPException, Request
 
+from .config import get_settings
 from .connectors import get_connector
 from .db import close_pool, fetch_one, open_pool, transaction
 from .engine import queue
@@ -57,7 +58,13 @@ async def receive_webhook(provider: str, connection_id: UUID, request: Request) 
 
     connector = get_connector(provider)
     headers = {k.lower(): v for k, v in request.headers.items()}
-    if not connector.verify_webhook(raw_body, headers):
+    # Rebuilt from PUBLIC_URL rather than request.url: behind a proxy or a
+    # tunnel the app sees http://localhost:8000/..., but the provider signed
+    # the https URL it actually called.
+    public_url = get_settings().public_url.rstrip("/") + request.url.path
+    if request.url.query:
+        public_url += "?" + request.url.query
+    if not connector.verify_webhook(raw_body, headers, public_url):
         raise HTTPException(status_code=400, detail="invalid signature")
 
     events = connector.parse_webhook(raw_body, headers)
