@@ -21,9 +21,11 @@ from datetime import datetime
 from uuid import UUID
 
 from psycopg import AsyncConnection
+from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from ..core.mapping import MappingDocument, MappingError, apply_mapping
+from . import identity
 
 UPSERT_SQL = """
 INSERT INTO provider_record (
@@ -96,26 +98,39 @@ async def store(
         )
         return "dead_letter"
 
-    cur = await conn.execute(
-        UPSERT_SQL,
-        {
-            "connection_id": connection_id,
-            "external_id": mapped.external_id,
-            "raw": Jsonb(payload),
-            **mapped.person.model_dump(),
-            "mapping_id": mapping_id,
-            "source_created_at": mapped.source_created_at,
-            "source_updated_at": mapped.source_updated_at,
-            # A provider timestamp, where there is one, is a better version
-            # than our clock. Stripe has none, so it falls back.
-            "observed_at": mapped.source_updated_at or observed_at,
-        },
-    )
-    return "stored" if await cur.fetchone() else "stale"
+    record_id = await _returning_id(conn, UPSERT_SQL, {
+        "connection_id": connection_id,
+        "external_id": mapped.external_id,
+        "raw": Jsonb(payload),
+        **mapped.person.model_dump(),
+        "mapping_id": mapping_id,
+        "source_created_at": mapped.source_created_at,
+        "source_updated_at": mapped.source_updated_at,
+        # A provider timestamp, where there is one, is a better version
+        # than our clock. Stripe has none, so it falls back.
+        "observed_at": mapped.source_updated_at or observed_at,
+    })
+    if record_id is None:
+        return "stale"
+    # Same transaction as the upsert: the person is never behind its records.
+    await identity.resolve(conn, record_id)
+    return "stored"
 
 
 async def tombstone(conn: AsyncConnection, connection_id: UUID, external_id: str, *, observed_at: datetime) -> str:
-    cur = await conn.execute(
-        TOMBSTONE_SQL, {"connection_id": connection_id, "external_id": external_id, "observed_at": observed_at}
+    record_id = await _returning_id(
+        conn, TOMBSTONE_SQL, {"connection_id": connection_id, "external_id": external_id, "observed_at": observed_at}
     )
-    return "deleted" if await cur.fetchone() else "stale"
+    if record_id is None:
+        return "stale"
+    await identity.resolve(conn, record_id)
+    return "deleted"
+
+
+async def _returning_id(conn: AsyncConnection, sql: str, params: dict) -> UUID | None:
+    """The id from `RETURNING id`, or None when the observed_at guard
+    rejected the write and nothing was returned."""
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(sql, params)
+        row = await cur.fetchone()
+    return row["id"] if row else None

@@ -26,6 +26,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache
 from typing import Callable
+from uuid import UUID
+
+from psycopg import AsyncConnection
+from psycopg.rows import dict_row
 
 PRECEDENCE_FILE = pathlib.Path(__file__).resolve().parents[3] / "config" / "field_precedence.json"
 
@@ -162,3 +166,95 @@ def detect_conflicts(records: list[LinkedRecord]) -> list[Conflict]:
                     losing_observed_at=loser.observed_at,
                 ))
     return conflicts
+
+
+
+# --------------------------------------------------------------------------
+# applying it: the SQL
+# --------------------------------------------------------------------------
+
+# ON CONFLICT ... DO UPDATE rather than DO NOTHING, on purpose. DO UPDATE
+# takes a row lock on the person even when the row already exists. So when a
+# Stripe record and a HubSpot record with the same email are saved at the
+# same moment, the second transaction waits here until the first commits,
+# and its recompute then sees both records. With DO NOTHING each would
+# recompute from only its own record, and a disagreement between them would
+# go undetected.
+CLAIM_PERSON_SQL = """
+INSERT INTO person (workspace_id, primary_email)
+SELECT c.workspace_id, %(email)s FROM connection c WHERE c.id = %(connection_id)s
+ON CONFLICT (workspace_id, primary_email) DO UPDATE SET updated_at = now()
+RETURNING id
+"""
+
+LINK_SQL = """
+INSERT INTO person_link (person_id, provider_record_id, match_rule)
+VALUES (%(person_id)s, %(record_id)s, 'email_exact')
+ON CONFLICT (provider_record_id)
+DO UPDATE SET person_id = EXCLUDED.person_id, match_rule = EXCLUDED.match_rule, matched_at = now()
+"""
+
+LIVE_RECORDS_SQL = """
+SELECT c.provider, pr.observed_at, pr.full_name, pr.given_name, pr.family_name, pr.phone
+FROM provider_record pr
+JOIN connection c ON c.id = pr.connection_id
+WHERE pr.person_id = %s AND pr.deleted_at IS NULL
+"""
+
+
+async def _one(conn: AsyncConnection, sql: str, params) -> dict | None:
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(sql, params)
+        return await cur.fetchone()
+
+
+async def resolve(conn: AsyncConnection, record_id: UUID) -> None:
+    """Attach one provider record to its person and recompute that person.
+
+    Called inside the same transaction that saved the record, so a record and
+    its person are never out of step. If the record's email changed, it moves
+    to the person with the new email, and the person it left is recomputed
+    too (or deleted, if nothing points at it any more).
+    """
+    row = await _one(conn, "SELECT connection_id, primary_email, person_id, deleted_at "
+                           "FROM provider_record WHERE id = %s", (record_id,))
+    previous = row["person_id"]
+
+    if row["deleted_at"] is not None or not row["primary_email"]:
+        # A tombstone keeps its link for the audit trail but stops counting.
+        if previous:
+            await recompute(conn, previous)
+        return
+
+    person_id = (await _one(conn, CLAIM_PERSON_SQL, {"email": row["primary_email"],
+                                                     "connection_id": row["connection_id"]}))["id"]
+    await conn.execute(LINK_SQL, {"person_id": person_id, "record_id": record_id})
+    await conn.execute("UPDATE provider_record SET person_id = %s WHERE id = %s", (person_id, record_id))
+    await recompute(conn, person_id)
+
+    if previous and previous != person_id:
+        await recompute(conn, previous)
+
+
+async def recompute(conn: AsyncConnection, person_id: UUID) -> None:
+    """Rebuild one person's fields from its live records."""
+    # Lock first, so two transactions recomputing the same person take turns.
+    if await _one(conn, "SELECT id FROM person WHERE id = %s FOR UPDATE", (person_id,)) is None:
+        return
+
+    if (await _one(conn, "SELECT count(*) AS n FROM person_link WHERE person_id = %s", (person_id,)))["n"] == 0:
+        # Every record moved away (an email change). A person exists only
+        # because some record points at it, so this one goes.
+        await conn.execute("DELETE FROM person WHERE id = %s", (person_id,))
+        return
+
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(LIVE_RECORDS_SQL, (person_id,))
+        linked = [LinkedRecord(**r) for r in await cur.fetchall()]
+
+    await conn.execute(
+        """UPDATE person SET full_name = %(full_name)s, given_name = %(given_name)s,
+               family_name = %(family_name)s, phone = %(phone)s, updated_at = now()
+           WHERE id = %(person_id)s""",
+        {**merge(linked), "person_id": person_id},
+    )
