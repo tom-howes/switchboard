@@ -119,27 +119,33 @@ COMPARED: dict[str, tuple[Callable[[LinkedRecord], str | None], Callable[[str], 
 # --------------------------------------------------------------------------
 
 
-def _latest_per_provider(records: list[LinkedRecord]) -> dict[str, LinkedRecord]:
-    """Two Stripe customers can share an email (Stripe allows it, and it
-    happens constantly). Within one provider the most recent observation
-    stands for that provider; cross-provider precedence then applies."""
-    latest: dict[str, LinkedRecord] = {}
+def _value_per_provider(
+    records: list[LinkedRecord], read: Callable[[LinkedRecord], str | None]
+) -> list[tuple[LinkedRecord, str]]:
+    """For one field: each provider's value, taken from its most recent record
+    that HAS a value for that field.
+
+    Per field, not per record. Two Stripe customers can share an email (Stripe
+    allows it, and it happens constantly). If the newest one has no phone, the
+    older one's phone still speaks for Stripe; a blank never shadows a value.
+    """
+    best: dict[str, tuple[LinkedRecord, str]] = {}
     for r in records:
-        if r.provider not in latest or r.observed_at > latest[r.provider].observed_at:
-            latest[r.provider] = r
-    return latest
+        value = read(r)
+        if value and (r.provider not in best or r.observed_at > best[r.provider][0].observed_at):
+            best[r.provider] = (r, value)
+    return list(best.values())
 
 
 def merge(records: list[LinkedRecord]) -> dict[str, str | None]:
-    """The person's field values: for each field, the highest-precedence
-    provider that has a value. A provider with nothing for a field falls
-    through to the next, so a blank never beats a real value."""
-    by_provider = _latest_per_provider(records)
+    """The person's field values: for each field, the value from the
+    highest-precedence provider that has one. A provider with nothing for a
+    field falls through to the next, so a blank never beats a real value."""
     result: dict[str, str | None] = {}
     for field in PERSON_FIELDS:
-        candidates = [r for r in by_provider.values() if getattr(r, field)]
-        candidates.sort(key=lambda r: rank(field, r.provider))
-        result[field] = getattr(candidates[0], field) if candidates else None
+        candidates = _value_per_provider(records, lambda r, f=field: getattr(r, f))
+        candidates.sort(key=lambda pair: rank(field, pair[0].provider))
+        result[field] = candidates[0][1] if candidates else None
     return result
 
 
@@ -147,11 +153,9 @@ def detect_conflicts(records: list[LinkedRecord]) -> list[Conflict]:
     """Every (field, losing provider) pair where a provider's value differs
     from the winning provider's. Providers with no value do not conflict:
     missing is not the same as different."""
-    by_provider = _latest_per_provider(records)
     conflicts = []
     for field, (read, normalise) in COMPARED.items():
-        present = [(r, read(r)) for r in by_provider.values()]
-        present = [(r, v) for r, v in present if v]
+        present = _value_per_provider(records, read)
         if len(present) < 2:
             continue
         present.sort(key=lambda pair: rank(field, pair[0].provider))
@@ -166,7 +170,6 @@ def detect_conflicts(records: list[LinkedRecord]) -> list[Conflict]:
                     losing_observed_at=loser.observed_at,
                 ))
     return conflicts
-
 
 
 # --------------------------------------------------------------------------
@@ -199,6 +202,22 @@ SELECT c.provider, pr.observed_at, pr.full_name, pr.given_name, pr.family_name, 
 FROM provider_record pr
 JOIN connection c ON c.id = pr.connection_id
 WHERE pr.person_id = %s AND pr.deleted_at IS NULL
+"""
+
+
+# Updated in place while the disagreement lasts (the partial unique index in
+# migration 003 allows one open row per person, field and losing provider).
+OPEN_CONFLICT_SQL = """
+INSERT INTO field_conflict (person_id, field, winning_value, winning_provider, winning_updated_at,
+                            losing_value, losing_provider, losing_updated_at)
+VALUES (%(person_id)s, %(field)s, %(winning_value)s, %(winning_provider)s, %(winning_observed_at)s,
+        %(losing_value)s, %(losing_provider)s, %(losing_observed_at)s)
+ON CONFLICT (person_id, field, losing_provider) WHERE resolved_at IS NULL
+DO UPDATE SET winning_value      = EXCLUDED.winning_value,
+              winning_provider   = EXCLUDED.winning_provider,
+              winning_updated_at = EXCLUDED.winning_updated_at,
+              losing_value       = EXCLUDED.losing_value,
+              losing_updated_at  = EXCLUDED.losing_updated_at
 """
 
 
@@ -237,7 +256,7 @@ async def resolve(conn: AsyncConnection, record_id: UUID) -> None:
 
 
 async def recompute(conn: AsyncConnection, person_id: UUID) -> None:
-    """Rebuild one person's fields from its live records."""
+    """Rebuild one person's fields, and open or close its conflicts."""
     # Lock first, so two transactions recomputing the same person take turns.
     if await _one(conn, "SELECT id FROM person WHERE id = %s FOR UPDATE", (person_id,)) is None:
         return
@@ -258,3 +277,29 @@ async def recompute(conn: AsyncConnection, person_id: UUID) -> None:
            WHERE id = %(person_id)s""",
         {**merge(linked), "person_id": person_id},
     )
+    await _sync_conflicts(conn, person_id, detect_conflicts(linked))
+
+
+async def _sync_conflicts(conn: AsyncConnection, person_id: UUID, conflicts: list[Conflict]) -> None:
+    """Make the open conflicts match what disagrees right now.
+
+    Current disagreements are upserted. Open conflicts that no longer appear
+    have converged (someone fixed the value, or a record was deleted) and are
+    closed rather than deleted, so the history of what disagreed is kept.
+    """
+    for c in conflicts:
+        await conn.execute(OPEN_CONFLICT_SQL, {"person_id": person_id, **c.__dict__})
+
+    current = {(c.field, c.losing_provider) for c in conflicts}
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            "SELECT id, field, losing_provider FROM field_conflict WHERE person_id = %s AND resolved_at IS NULL",
+            (person_id,),
+        )
+        open_rows = await cur.fetchall()
+    for row in open_rows:
+        if (row["field"], row["losing_provider"]) not in current:
+            await conn.execute(
+                "UPDATE field_conflict SET resolved_at = now(), resolution = 'converged' WHERE id = %s",
+                (row["id"],),
+            )

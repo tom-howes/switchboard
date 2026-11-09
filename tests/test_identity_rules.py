@@ -36,6 +36,11 @@ class TestMerge:
         person = merge([stripe(full_name="Old Name", at=T), stripe(full_name="New Name", at=T + timedelta(days=1))])
         assert person["full_name"] == "New Name"
 
+    def test_a_blank_newer_duplicate_does_not_hide_an_older_value(self):
+        # Two Stripe customers, one email: the newest has no name
+        person = merge([stripe(full_name="Tom Howes", at=T), stripe(at=T + timedelta(days=1))])
+        assert person["full_name"] == "Tom Howes"
+
     def test_unlisted_providers_rank_last(self):
         assert rank("phone", "salesforce") > rank("phone", "stripe")
 

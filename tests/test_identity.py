@@ -104,5 +104,66 @@ class TestLinking:
             save(workspace, "stripe", stripe_customer("cus_1", "tom@example.com")),
             save(workspace, "hubspot", hubspot_contact("501", "tom@example.com")),
         )
-        # Both records counted: Stripe's full name and HubSpot's split names
         assert await people(db) == [("tom@example.com", "Tom Howes", "Tom", "Howes", "8573519582")]
+
+async def conflicts(db, open_only: bool = True) -> list[tuple]:
+    cur = await db.execute(
+        "SELECT field, winning_provider, winning_value, losing_provider, losing_value, resolution FROM field_conflict"
+        + (" WHERE resolved_at IS NULL" if open_only else "") + " ORDER BY field"
+    )
+    return await cur.fetchall()
+
+
+class TestConflicts:
+    async def test_name_disagreement_is_recorded_with_hubspot_winning(self, db, workspace):
+        await save(workspace, "stripe", stripe_customer("cus_1", "tom@example.com", name="Thomas Howes"))
+        await save(workspace, "hubspot", hubspot_contact("501", "tom@example.com"))
+        assert await conflicts(db) == [("name", "hubspot", "Tom Howes", "stripe", "Thomas Howes", None)]
+
+    async def test_country_code_is_not_a_conflict(self, db, workspace):
+        await save(workspace, "stripe", stripe_customer("cus_1", "tom@example.com", phone="+1 857 351 9582"))
+        await save(workspace, "hubspot", hubspot_contact("501", "tom@example.com", phone="857-351-9582"))
+        assert await conflicts(db) == []
+
+    async def test_repeated_saves_update_one_conflict_not_many(self, db, workspace):
+        await save(workspace, "stripe", stripe_customer("cus_1", "tom@example.com", phone="+1 617 555 0100"))
+        for i in range(3):
+            await save(workspace, "hubspot", hubspot_contact("501", "tom@example.com", at=T + timedelta(minutes=i)))
+        assert [c[0] for c in await conflicts(db)] == ["phone"]
+        cur = await db.execute("SELECT count(*) FROM field_conflict")
+        assert (await cur.fetchone())[0] == 1
+
+    async def test_fixing_the_value_closes_the_conflict(self, db, workspace):
+        await save(workspace, "stripe", stripe_customer("cus_1", "tom@example.com", phone="+1 617 555 0100"))
+        await save(workspace, "hubspot", hubspot_contact("501", "tom@example.com"))
+        await save(workspace, "hubspot", hubspot_contact("501", "tom@example.com", phone="617-555-0100",
+                                                         at=T + timedelta(hours=1)))
+        assert await conflicts(db) == []
+        closed = await conflicts(db, open_only=False)
+        assert [(c[0], c[5]) for c in closed] == [("phone", "converged")]  # kept as history
+
+    async def test_deleting_the_disagreeing_record_closes_the_conflict(self, db, workspace):
+        await save(workspace, "stripe", stripe_customer("cus_1", "tom@example.com", name="Thomas Howes"))
+        await save(workspace, "hubspot", hubspot_contact("501", "tom@example.com"))
+        await delete(workspace, "stripe", "cus_1", at=T + timedelta(hours=1))
+        assert await conflicts(db) == []
+
+    async def test_concurrent_saves_for_an_existing_person_still_detect_the_conflict(self, db, workspace):
+        """The race the person row lock exists for.
+
+        The person already exists (from an earlier Stripe record with no name).
+        A new Stripe record and a HubSpot record for the same email are then
+        saved at the same moment. Without the lock, each transaction recomputes
+        while the other's record is still uncommitted, so neither sees both
+        names and the disagreement is never recorded. Repeated, because a race
+        test that passes once proves little.
+        """
+        for i in range(10):
+            email = f"tom{i}@example.com"
+            await save(workspace, "stripe", stripe_customer(f"cus_old{i}", email, name=None, phone=None))
+            await asyncio.gather(
+                save(workspace, "stripe", stripe_customer(f"cus_new{i}", email, name="Thomas Howes", phone=None)),
+                save(workspace, "hubspot", hubspot_contact(f"50{i}", email, phone=None)),
+            )
+        cur = await db.execute("SELECT count(*) FROM field_conflict WHERE field = 'name' AND resolved_at IS NULL")
+        assert (await cur.fetchone())[0] == 10
