@@ -59,7 +59,7 @@ SET cursor       = %(next)s,
     completed_at = CASE WHEN %(next)s::text IS NULL THEN now() END,
     updated_at   = now()
 WHERE connection_id = %(connection_id)s
-  AND kind = 'backfill'
+  AND kind = %(kind)s
   AND completed_at IS NULL
   AND cursor IS NOT DISTINCT FROM %(current)s
 """
@@ -89,7 +89,8 @@ async def backfill_page(job: Job) -> None:
 
     async with db.transaction() as conn:
         cur = await conn.execute(
-            ADVANCE_CURSOR_SQL, {"next": page.next_cursor, "current": current, "connection_id": job.connection_id}
+            ADVANCE_CURSOR_SQL,
+            {"next": page.next_cursor, "current": current, "connection_id": job.connection_id, "kind": "backfill"}
         )
         if cur.rowcount == 0:
             log.info("backfill page %r for %s already applied; skipping", current, job.connection_id)

@@ -78,7 +78,7 @@ async def run_forever() -> None:
     is the part that has to exist either way.
     """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    from . import sync  # noqa: F401  importing it registers the handlers
+    from . import reconcile, sync  # noqa: F401  importing them registers the handlers
 
     await db.open_pool()
     loop = asyncio.get_running_loop()

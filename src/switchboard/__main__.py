@@ -51,7 +51,7 @@ async def _connect(provider: str) -> None:
     """
     from . import db
     from .connectors import get_connector
-    from .engine import connections, mappings, sync
+    from .engine import connections, mappings, reconcile, sync
 
     connector = get_connector(provider)
     creds = await connector.authorize(code="", state="")
@@ -73,6 +73,8 @@ async def _connect(provider: str) -> None:
 
             connection_id = await connections.save(conn, workspace_id, provider, creds)
             await sync.start_backfill(conn, connection_id)
+            # First sweep a day out; each sweep schedules the next.
+            await reconcile.schedule(conn, connection_id)
     finally:
         await db.close_pool()
     print(f"connected {provider}: {connection_id}")
