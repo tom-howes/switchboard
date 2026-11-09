@@ -91,3 +91,59 @@ class TestWalk:
         await drain()
         cur = await db.execute("SELECT status, error IS NOT NULL FROM sync_run ORDER BY started_at")
         assert await cur.fetchall() == [("failed", True), ("completed", False)]
+
+
+class TestMissing:
+    @respx.mock
+    async def test_confirmed_gone_is_deleted(self, db, pool, stripe):
+        await backfill(pool, stripe, [[customer(1), customer(2)]])
+        respx.reset()
+        mock_customers([[customer(1)]])  # cus_2 no longer listed...
+        respx.get(f"{API}/customers/cus_2").mock(return_value=httpx.Response(404, json={}))  # ...and really gone
+        await start(pool, stripe)
+        await drain()
+        run = await last_run(db)
+        assert (run["status"], run["missing"], run["deleted"]) == ("completed", 1, 1)
+        assert (await names(db))["cus_2"][1] is True
+
+    @respx.mock
+    async def test_missing_from_the_list_but_still_there_is_kept(self, db, pool, stripe):
+        await backfill(pool, stripe, [[customer(1), customer(2)]])
+        respx.reset()
+        mock_customers([[customer(1)]])
+        respx.get(f"{API}/customers/cus_2").mock(
+            return_value=httpx.Response(200, json=customer(2, name="Still Here")))
+        await start(pool, stripe)
+        await drain()
+        run = await last_run(db)
+        assert (run["missing"], run["deleted"]) == (1, 0)
+        assert (await names(db))["cus_2"] == ("Still Here", False)
+
+    @respx.mock
+    async def test_many_missing_trips_the_breaker_and_deletes_nothing(self, db, pool, stripe):
+        await backfill(pool, stripe, [[customer(n) for n in range(1, 31)]])
+        respx.reset()
+        mock_customers([[customer(1)]])  # 29 of 30 vanished: the walk is broken, not the customers
+        single = respx.get(url__regex=rf"{API}/customers/cus_\d+")
+        await start(pool, stripe)
+        await drain()
+        run = await last_run(db)
+        assert run["status"] == "failed" and "circuit breaker" in run["error"]
+        assert (run["missing"], run["deleted"]) == (29, 0)
+        assert not single.called  # not even checked one by one
+        assert not any(deleted for _, deleted in (await names(db)).values())
+
+    @respx.mock
+    async def test_large_missing_sets_are_confirmed_in_batches(self, db, pool, stripe, monkeypatch):
+        monkeypatch.setattr(reconcile, "CONFIRM_BATCH", 2)
+        monkeypatch.setattr(reconcile, "MISSING_ALARM_FLOOR", 100)  # not testing the breaker here
+        await backfill(pool, stripe, [[customer(n) for n in range(1, 6)]])
+        respx.reset()
+        mock_customers([[customer(1)]])
+        respx.get(url__regex=rf"{API}/customers/cus_\d+").mock(return_value=httpx.Response(404, json={}))
+        await start(pool, stripe)
+        await drain()
+        run = await last_run(db)
+        assert (run["status"], run["missing"], run["deleted"]) == ("completed", 4, 4)
+        cur = await db.execute("SELECT count(*) FROM sync_job WHERE payload->>'phase' = 'confirm'")
+        assert (await cur.fetchone())[0] == 2  # 4 missing in batches of 2

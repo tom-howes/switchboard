@@ -50,6 +50,18 @@ RECONCILE_EVERY = timedelta(hours=24)
 # blocked by the one-running-per-connection index forever.
 ABANDONED_AFTER = timedelta(hours=6)
 
+# Missing records are confirmed in batches, so one confirm job stays well
+# inside the worker lease even when there are hundreds to check.
+CONFIRM_BATCH = 50
+
+# The circuit breaker. If more than this share of a connection's live records
+# went missing in one walk, the walk is far more likely to be broken (a paging
+# bug, a provider returning partial results) than a fifth of the customers to
+# have been deleted overnight. The run fails loudly and nothing is checked or
+# deleted. The floor stops a five-record test account tripping it over one.
+MISSING_ALARM_FRACTION = 0.2
+MISSING_ALARM_FLOOR = 10
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -181,8 +193,90 @@ async def _finish(conn: AsyncConnection, run_id: str, connection_id: UUID, *, er
     await schedule(conn, connection_id)
 
 
+# Live records this walk did not return. fetched_at guards the race where a
+# webhook created a record after the walk had already passed its page: it was
+# written after the run started, so it is clearly alive, not missing.
+MISSING_SQL = """
+SELECT external_id FROM provider_record
+WHERE connection_id = %(connection_id)s
+  AND deleted_at IS NULL
+  AND (last_seen_at IS NULL OR last_seen_at < %(started_at)s)
+  AND fetched_at < %(started_at)s
+ORDER BY external_id
+"""
+
+
+async def _missing(conn: AsyncConnection, connection_id: UUID, started_at: datetime) -> list[str]:
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(MISSING_SQL, {"connection_id": connection_id, "started_at": started_at})
+        return [r["external_id"] for r in await cur.fetchall()]
+
+
 async def _confirm(job: Job) -> None:
-    async with db.transaction() as conn:
-        if await _running(conn, job.payload["run_id"]) is None:
+    """Ask the provider about each record the walk did not return.
+
+    Only a confirmed absence (fetch_one returns None: a 404, or Stripe's
+    deleted stub) becomes a tombstone. Absence from a listing is a hint, not
+    proof. A listing can skip records for reasons that have nothing to do with
+    the record, and a delete is the one mistake a sync engine cannot quietly
+    undo.
+    """
+    run_id = job.payload["run_id"]
+    async with db.pool().connection() as conn:
+        run = await _running(conn, run_id)
+        if run is None:
             return
-        await _finish(conn, job.payload["run_id"], job.connection_id)
+        missing = await _missing(conn, job.connection_id, run["started_at"])
+        connection = await connections.load(conn, job.connection_id)
+        mapping_id, mapping = await mappings.approved(conn, connection.provider)
+
+        if not job.payload.get("breaker_checked"):
+            cur = await conn.execute(
+                "SELECT count(*) AS live FROM provider_record WHERE connection_id = %s AND deleted_at IS NULL",
+                (job.connection_id,),
+            )
+            live = (await cur.fetchone())["live"]
+            if len(missing) > max(MISSING_ALARM_FLOOR, MISSING_ALARM_FRACTION * live):
+                async with conn.transaction():
+                    await conn.execute("UPDATE sync_run SET records_missing = %s WHERE id = %s",
+                                       (len(missing), run_id))
+                    await _finish(conn, run_id, job.connection_id, error=(
+                        f"circuit breaker: {len(missing)} of {live} live records missing from the walk; "
+                        "nothing was deleted. Check the connector before trusting this sweep."))
+                log.error("reconcile %s tripped the circuit breaker (%d of %d missing)",
+                          job.connection_id, len(missing), live)
+                return
+
+    batch, remaining = missing[:CONFIRM_BATCH], missing[CONFIRM_BATCH:]
+    connector = get_connector(connection.provider)
+    creds = await connections.fresh_credentials(connection, connector)
+    observed_at = _now()
+    answers = {external_id: await connector.fetch_one(creds, external_id) for external_id in batch}
+
+    async with db.transaction() as conn:
+        if await _running(conn, run_id) is None:
+            return
+        deleted = 0
+        for external_id, record in answers.items():
+            if record is None:
+                await records.tombstone(conn, job.connection_id, external_id, observed_at=observed_at)
+                deleted += 1
+            else:
+                # Still there; the listing just did not return it. Store what
+                # we learned and mark it seen so the next batch skips it.
+                await records.store(conn, job.connection_id, mapping_id, mapping, record.payload,
+                                    observed_at=observed_at, job_id=job.id)
+                await conn.execute(
+                    "UPDATE provider_record SET last_seen_at = now() WHERE connection_id = %s AND external_id = %s",
+                    (job.connection_id, external_id),
+                )
+        await conn.execute(
+            "UPDATE sync_run SET records_missing = records_missing + %s, records_deleted = records_deleted + %s "
+            "WHERE id = %s",
+            (len(batch), deleted, run_id),
+        )
+        if remaining:
+            await queue.enqueue(conn, job.connection_id, "reconcile",
+                                {"phase": "confirm", "run_id": run_id, "breaker_checked": True})
+        else:
+            await _finish(conn, run_id, job.connection_id)

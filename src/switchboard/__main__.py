@@ -88,7 +88,29 @@ def connect() -> None:
     run(_connect(sys.argv[2]))
 
 
-COMMANDS = {"serve": serve, "worker": worker, "connect": connect}
+async def _reconcile_now(connection_id: str) -> None:
+    from . import db
+    from .engine import reconcile
+    from datetime import timedelta
+
+    await db.open_pool()
+    try:
+        async with db.transaction() as conn:
+            await reconcile.schedule(conn, connection_id, after=timedelta(0))
+    finally:
+        await db.close_pool()
+    print(f"reconcile queued for {connection_id}; the worker will pick it up")
+
+
+def reconcile_now() -> None:
+    """Run a sweep now instead of waiting for the daily one. If a sweep is
+    already in flight this one steps aside, so it is always safe to run."""
+    if len(sys.argv) < 3:
+        raise SystemExit("usage: python -m switchboard reconcile <connection_id>")
+    run(_reconcile_now(sys.argv[2]))
+
+
+COMMANDS = {"serve": serve, "worker": worker, "connect": connect, "reconcile": reconcile_now}
 
 
 if __name__ == "__main__":
