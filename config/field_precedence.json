@@ -1,0 +1,8 @@
+{
+  "_comment": "Which system's value goes on the person record, per field. First provider in the list with a value wins; providers not listed rank last. 'name' is not a column: it is the comparison used for conflict reporting (Stripe's full name against HubSpot's first + last).",
+  "full_name":   ["stripe", "hubspot"],
+  "given_name":  ["hubspot", "stripe"],
+  "family_name": ["hubspot", "stripe"],
+  "phone":       ["hubspot", "stripe"],
+  "name":        ["hubspot", "stripe"]
+}
