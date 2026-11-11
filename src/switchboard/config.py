@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     hubspot_client_secret: str = ""
 
     anthropic_api_key: str = ""
-    mapping_model: str = "claude-sonnet-5-5"
+    mapping_model: str = "claude-opus-5-5"
 
 
 @lru_cache
