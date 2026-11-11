@@ -110,7 +110,99 @@ def reconcile_now() -> None:
     run(_reconcile_now(sys.argv[2]))
 
 
-COMMANDS = {"serve": serve, "worker": worker, "connect": connect, "reconcile": reconcile_now}
+async def _propose(provider: str, sample_file: str | None) -> None:
+    import json
+    import pathlib
+
+    from . import db
+    from .connectors import get_connector
+    from .core.mapping import MappingDocument, MappingError, apply_mapping
+    from .engine import connections, mappings
+    from .llm.proposer import propose
+
+    await db.open_pool()
+    try:
+        if sample_file:
+            loaded = json.loads(pathlib.Path(sample_file).read_text(encoding="utf-8"))
+            samples = loaded if isinstance(loaded, list) else [loaded]
+        else:
+            # A first page straight from the provider, using the stored connection.
+            async with db.pool().connection() as conn:
+                cur = await conn.execute(
+                    "SELECT c.id FROM connection c JOIN workspace w ON w.id = c.workspace_id "
+                    "WHERE w.name = 'default' AND c.provider = %s", (provider,))
+                row = await cur.fetchone()
+                if row is None:
+                    raise SystemExit(f"no {provider} connection; run `connect {provider}` or pass --sample FILE")
+                connection = await connections.load(conn, row["id"])
+            connector = get_connector(provider)
+            creds = await connections.fresh_credentials(connection, connector)
+            samples = [r.payload for r in (await connector.list_changes(creds, None)).records]
+
+        proposal = await propose(provider, samples)
+        async with db.transaction() as conn:
+            mapping_id = await mappings.save_proposal(
+                conn, provider, proposal.rules, proposed_by="claude", model=proposal.model,
+                notes=proposal.notes, sample=proposal.masked_samples)
+    finally:
+        await db.close_pool()
+
+    print(json.dumps(proposal.rules, indent=2))
+    for name, note in proposal.notes["fields"].items():
+        print(f"  {name:<14} [{note['confidence']}] {note['reasoning']}")
+    if proposal.notes["unmapped"]:
+        print(f"  notes: {proposal.notes['unmapped']}")
+    # Preview on the REAL samples, locally. They never left this machine; only
+    # the masked copies were sent.
+    doc = MappingDocument.model_validate(proposal.rules)
+    print("\npreview on your actual records:")
+    for sample in samples[:3]:
+        try:
+            print(" ", apply_mapping(sample, doc).person.model_dump())
+        except MappingError as exc:
+            print("  could not map:", exc)
+    print(f"\nproposal saved as {mapping_id} (status: proposed)")
+    print(f"approve with: python -m switchboard approve-mapping {mapping_id}")
+
+
+def propose_mapping() -> None:
+    """Have Claude draft a mapping for a provider. Saved as 'proposed' only."""
+    args = sys.argv[2:]
+    if not args:
+        raise SystemExit("usage: python -m switchboard propose <provider> [--sample FILE]")
+    sample_file = args[args.index("--sample") + 1] if "--sample" in args else None
+    run(_propose(args[0], sample_file))
+
+
+async def _approve(mapping_id: str) -> None:
+    import getpass
+
+    from . import db
+    from .engine import mappings
+
+    await db.open_pool()
+    try:
+        async with db.pool().connection() as conn:
+            provider = await mappings.approve_proposal(conn, mapping_id, approved_by=getpass.getuser())
+    finally:
+        await db.close_pool()
+    print(f"mapping {mapping_id} is now the approved {provider} mapping")
+
+
+def approve_mapping() -> None:
+    if len(sys.argv) < 3:
+        raise SystemExit("usage: python -m switchboard approve-mapping <mapping_id>")
+    run(_approve(sys.argv[2]))
+
+
+COMMANDS = {
+    "serve": serve,
+    "worker": worker,
+    "connect": connect,
+    "reconcile": reconcile_now,
+    "propose": propose_mapping,
+    "approve-mapping": approve_mapping,
+}
 
 
 if __name__ == "__main__":
