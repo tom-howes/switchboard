@@ -33,7 +33,8 @@ def apply(url: str) -> list[str]:
     that drifts.
     """
     applied: list[str] = []
-    with psycopg.connect(url, autocommit=False) as conn:
+    # A timeout so a stopped database fails in seconds instead of hanging.
+    with psycopg.connect(url, autocommit=False, connect_timeout=5) as conn:
         with conn.cursor() as cur:
             cur.execute(LEDGER)
             cur.execute("SELECT filename FROM schema_migration")
