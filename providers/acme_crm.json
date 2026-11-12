@@ -1,0 +1,9 @@
+{
+  "id": "acme_crm",
+  "base_url": "https://api.acme-crm.example/v2",
+  "auth": {"style": "header", "header": "X-Api-Key", "env": {"api_key": "ACME_CRM_API_KEY"}},
+  "list": {"path": "/people", "records": "$.results", "id": "$.uuid", "params": {"status": "active"}},
+  "fetch_one": {"path": "/people/{id}", "record": "$"},
+  "pagination": {"style": "page", "param": "page", "start": 1, "page_size": 100, "size_param": "per_page"},
+  "reconcile_every_hours": 1
+}
