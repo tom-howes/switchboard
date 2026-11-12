@@ -51,6 +51,7 @@ async def _connect(provider: str) -> None:
     """
     from . import db
     from .connectors import get_connector
+    from .core.models import Capability
     from .engine import connections, mappings, reconcile, sync
 
     connector = get_connector(provider)
@@ -68,18 +69,27 @@ async def _connect(provider: str) -> None:
             cur = await conn.execute(
                 "SELECT 1 FROM field_mapping WHERE provider = %s AND status = 'approved'", (provider,)
             )
-            if await cur.fetchone() is None:
+            has_mapping = await cur.fetchone() is not None
+            if not has_mapping and mappings.has_seed(provider):
                 await mappings.approve(conn, provider, mappings.seed_rules(provider), approved_by="seed")
+                has_mapping = True
 
             connection_id = await connections.save(conn, workspace_id, provider, creds)
-            await sync.start_backfill(conn, connection_id)
-            # First sweep a day out; each sweep schedules the next.
+            if has_mapping:
+                await sync.start_backfill(conn, connection_id)
+            # The first sweep after one interval; each sweep schedules the next.
             await reconcile.schedule(conn, connection_id)
     finally:
         await db.close_pool()
     print(f"connected {provider}: {connection_id}")
-    print(f"webhook url: {get_settings().public_url}/webhooks/{provider}/{connection_id}")
-    print("backfill queued; run `python -m switchboard worker` to process it")
+    if Capability.WEBHOOKS in connector.capabilities:
+        print(f"webhook url: {get_settings().public_url}/webhooks/{provider}/{connection_id}")
+    if has_mapping:
+        print("backfill queued; run `python -m switchboard worker` to process it")
+    else:
+        # No hand-written mapping for this provider: draft one first. The
+        # backfill starts when it is approved.
+        print(f"no mapping yet: run `python -m switchboard propose {provider}`, then approve it")
 
 
 def connect() -> None:
@@ -178,15 +188,18 @@ async def _approve(mapping_id: str) -> None:
     import getpass
 
     from . import db
-    from .engine import mappings
+    from .engine import mappings, sync
 
     await db.open_pool()
     try:
         async with db.pool().connection() as conn:
             provider = await mappings.approve_proposal(conn, mapping_id, approved_by=getpass.getuser())
+            started = await sync.start_pending_backfills(conn, provider)
     finally:
         await db.close_pool()
     print(f"mapping {mapping_id} is now the approved {provider} mapping")
+    if started:
+        print(f"backfill started for {started} connection(s) that were waiting for a mapping")
 
 
 def approve_mapping() -> None:

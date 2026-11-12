@@ -64,6 +64,10 @@ async def approve(
             return (await cur.fetchone())["id"]
 
 
+def has_seed(provider: str) -> bool:
+    return (SEED_DIR / f"{provider}.json").exists()
+
+
 def seed_rules(provider: str) -> dict:
     return json.loads((SEED_DIR / f"{provider}.json").read_text(encoding="utf-8"))
 

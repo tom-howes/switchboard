@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from uuid import UUID
 
 from psycopg import AsyncConnection
+from psycopg.rows import dict_row
 
 from .. import db
 from ..connectors import get_connector
@@ -46,6 +47,26 @@ async def start_backfill(conn: AsyncConnection, connection_id: UUID) -> UUID:
         (connection_id,),
     )
     return await queue.enqueue(conn, connection_id, "backfill", {"cursor": None})
+
+
+async def start_pending_backfills(conn: AsyncConnection, provider: str) -> int:
+    """Start the backfill for connections that were waiting on a mapping.
+
+    A connection made before its provider had an approved mapping has no
+    backfill cursor at all; that absence is what marks it as waiting.
+    """
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            """SELECT c.id FROM connection c
+               WHERE c.provider = %s
+                 AND NOT EXISTS (SELECT 1 FROM sync_cursor s
+                                 WHERE s.connection_id = c.id AND s.kind = 'backfill')""",
+            (provider,),
+        )
+        waiting = [row["id"] for row in await cur.fetchall()]
+    for connection_id in waiting:
+        await start_backfill(conn, connection_id)
+    return len(waiting)
 
 
 # Compare-and-set on the cursor. The page is only written if the stored cursor

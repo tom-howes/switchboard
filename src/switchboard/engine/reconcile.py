@@ -67,7 +67,15 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-async def schedule(conn: AsyncConnection, connection_id: UUID, *, after: timedelta = RECONCILE_EVERY) -> UUID:
+async def schedule(conn: AsyncConnection, connection_id: UUID, *, after: timedelta | None = None) -> UUID:
+    """Queue the next sweep. The interval is the connector's own if it sets
+    one (generic connectors sweep hourly because they have no webhooks),
+    otherwise daily."""
+    if after is None:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute("SELECT provider FROM connection WHERE id = %s", (connection_id,))
+            provider = (await cur.fetchone())["provider"]
+        after = getattr(get_connector(provider), "reconcile_every", RECONCILE_EVERY)
     return await queue.enqueue(conn, connection_id, "reconcile", {"phase": "start"},
                                delay_seconds=after.total_seconds())
 

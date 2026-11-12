@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException, Request
 
 from .config import get_settings
 from .connectors import get_connector
+from .core.models import Capability
 from .db import close_pool, fetch_one, open_pool, transaction
 from .engine import queue
 
@@ -57,6 +58,10 @@ async def receive_webhook(provider: str, connection_id: UUID, request: Request) 
         raise HTTPException(status_code=404, detail="unknown connection")
 
     connector = get_connector(provider)
+    if Capability.WEBHOOKS not in connector.capabilities:
+        # Generic connectors are swept instead. A 404 tells a misconfigured
+        # sender plainly that nothing is listening here.
+        raise HTTPException(status_code=404, detail=f"{provider} does not accept webhooks")
     headers = {k.lower(): v for k, v in request.headers.items()}
     # Rebuilt from PUBLIC_URL rather than request.url: behind a proxy or a
     # tunnel the app sees http://localhost:8000/..., but the provider signed
